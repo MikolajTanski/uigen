@@ -49,3 +49,11 @@ next-env.d.ts
 # database
 /prisma/dev.db
 /prisma/dev.db-journal
+
+# logs
+logs.txt
+*.log
+lint-results.json
+test-results.json
+build-output.txt
+failure-report.txt

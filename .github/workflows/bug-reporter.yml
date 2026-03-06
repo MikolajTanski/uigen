@@ -1,0 +1,158 @@
+name: Bug Reporter
+
+on:
+  push:
+    branches: [main, master]
+  schedule:
+    - cron: '0 6 * * *'  # codziennie o 6:00 UTC
+  workflow_dispatch:
+
+jobs:
+  detect-bugs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Run lint
+        id: lint
+        run: npm run lint -- --format json --output-file lint-results.json 2>&1 || echo "LINT_FAILED=true" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Run tests
+        id: tests
+        run: npm test -- --reporter=json --outputFile=test-results.json 2>&1 || echo "TESTS_FAILED=true" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Build check
+        id: build
+        run: npm run build 2>&1 | tee build-output.txt || echo "BUILD_FAILED=true" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Prepare failure report
+        id: report
+        if: |
+          steps.lint.outputs.LINT_FAILED == 'true' ||
+          steps.tests.outputs.TESTS_FAILED == 'true' ||
+          steps.build.outputs.BUILD_FAILED == 'true'
+        run: |
+          REPORT=""
+
+          if [ "${{ steps.lint.outputs.LINT_FAILED }}" == "true" ]; then
+            REPORT="${REPORT}### Lint errors\n\`\`\`\n"
+            if [ -f lint-results.json ]; then
+              REPORT="${REPORT}$(cat lint-results.json | python3 -c "
+          import json,sys
+          data=json.load(sys.stdin)
+          for f in data:
+              errs=[m for m in f.get('messages',[]) if m['severity']==2]
+              if errs:
+                  print(f['filePath'])
+                  for e in errs[:5]:
+                      print(f\"  L{e['line']}: [{e['ruleId']}] {e['message']}\")
+          " 2>/dev/null || cat lint-results.json | head -60)"
+            fi
+            REPORT="${REPORT}\n\`\`\`\n\n"
+          fi
+
+          if [ "${{ steps.tests.outputs.TESTS_FAILED }}" == "true" ]; then
+            REPORT="${REPORT}### Test failures\n\`\`\`\n"
+            if [ -f test-results.json ]; then
+              REPORT="${REPORT}$(cat test-results.json | python3 -c "
+          import json,sys
+          data=json.load(sys.stdin)
+          for suite in data.get('testResults',[]):
+              fails=[t for t in suite.get('assertionResults',[]) if t['status']=='failed']
+              if fails:
+                  print(suite['testFilePath'])
+                  for t in fails[:5]:
+                      print(f\"  FAIL: {t['fullName']}\")
+                      for msg in t.get('failureMessages',[])[:1]:
+                          print(f\"    {msg[:200]}\")
+          " 2>/dev/null || cat test-results.json | head -60)"
+            fi
+            REPORT="${REPORT}\n\`\`\`\n\n"
+          fi
+
+          if [ "${{ steps.build.outputs.BUILD_FAILED }}" == "true" ]; then
+            REPORT="${REPORT}### Build errors\n\`\`\`\n"
+            REPORT="${REPORT}$(tail -40 build-output.txt)"
+            REPORT="${REPORT}\n\`\`\`\n\n"
+          fi
+
+          # Zapisz do pliku (unikamy problemów z escapowaniem w env)
+          printf "%b" "$REPORT" > failure-report.txt
+          echo "HAS_FAILURES=true" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Issue
+        if: steps.report.outputs.HAS_FAILURES == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('failure-report.txt', 'utf8');
+
+            const lintFailed  = '${{ steps.lint.outputs.LINT_FAILED }}'  === 'true';
+            const testsFailed = '${{ steps.tests.outputs.TESTS_FAILED }}' === 'true';
+            const buildFailed = '${{ steps.build.outputs.BUILD_FAILED }}' === 'true';
+
+            const parts = [];
+            if (lintFailed)  parts.push('Lint');
+            if (testsFailed) parts.push('Tests');
+            if (buildFailed) parts.push('Build');
+
+            const sha = context.sha.slice(0, 7);
+            const branch = context.ref.replace('refs/heads/', '');
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const body = `## Automated bug report
+
+            **Commit:** [\`${sha}\`](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/commit/${context.sha})
+            **Branch:** \`${branch}\`
+            **CI run:** [View logs](${runUrl})
+
+            The following checks failed: **${parts.join(', ')}**
+
+            ${report}
+
+            ---
+            @claude Please analyse the failures above and fix them. Create a pull request with the fix.`;
+
+            // Sprawdz czy jest juz otwarte issue dla tego commita
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'bug,automated',
+              state: 'open',
+            });
+
+            const alreadyOpen = existing.data.some(i => i.body && i.body.includes(sha));
+            if (alreadyOpen) {
+              console.log('Issue for this commit already exists, skipping.');
+              return;
+            }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[Auto] CI failure on \`${branch}\` (${sha}): ${parts.join(', ')}`,
+              body,
+              labels: ['bug', 'automated'],
+            });
