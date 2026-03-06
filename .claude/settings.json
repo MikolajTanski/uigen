@@ -1,6 +1,13 @@
 {
   "permissions": {
-    "allow": ["mcp__playwright","workflow"],
+    "allow": ["mcp__playwright", "workflow", "Bash"],
     "deny": []
+  },
+  "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["@playwright/mcp@latest"],
+      "env": {}
+    }
   }
 }
